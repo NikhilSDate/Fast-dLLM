@@ -87,18 +87,20 @@ class LLaDAEvalHarness(LM):
             cfg_scale: Unsupervised classifier-free guidance scale.
         '''
         super().__init__()
-
-        accelerator = accelerate.Accelerator()
-        if accelerator.num_processes > 1:
-            self.accelerator = accelerator
-        else:
-            self.accelerator = None
+        self.accelerator = None
+        # accelerator = accelerate.Accelerator()
+        
+        # if accelerator.num_processes > 1:
+        #     self.accelerator = accelerator
+        # else:
+        #     self.accelerator = None
         
         model_kwargs = {}
-        if self.accelerator is not None:
-            model_kwargs.update({'device_map': {'': f'{self.accelerator.device}'}})
+        # if self.accelerator is not None:
+        #     model_kwargs.update({'device_map': {'': f'{self.accelerator.device}'}})
         config = AutoConfig.from_pretrained(model_path)
         config.flash_attention = True
+        
         self.model = LLaDAModelLM.from_pretrained(model_path, trust_remote_code=True, torch_dtype=torch.bfloat16, config=config, **model_kwargs)
         self.model.eval()
 
