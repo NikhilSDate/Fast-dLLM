@@ -280,6 +280,7 @@ class LLaDAEvalHarness(LM):
         output = []
         num_tokens = 0
         num_nfe = 0
+        elapsed_offset = 0.0
         processed_count = 0
         if self.save_dir is not None:
             os.makedirs(self.save_dir, exist_ok=True)
@@ -289,14 +290,24 @@ class LLaDAEvalHarness(LM):
             if os.path.exists(save_path):
                 print(f"load from {save_path}")
                 with open(save_path, 'r', encoding='utf-8') as f:
-                    output = [json.loads(line) for line in f]
-                    processed_count = len(output)
+                    for line in f:
+                        entry = json.loads(line)
+                        if isinstance(entry, str):
+                            # old format: plain answer string
+                            output.append(entry)
+                        elif isinstance(entry, dict) and 'answer' in entry:
+                            output.append(entry['answer'])
+                            # restore cumulative totals from the last saved entry
+                            num_tokens = entry.get('tokens', num_tokens)
+                            num_nfe = entry.get('nfe', num_nfe)
+                            elapsed_offset = entry.get('elapsed', elapsed_offset)
+                        # skip summary lines or unrecognised entries
+                processed_count = len(output)
                 print(f"processed_count: {processed_count}")
         
         batched_requests = [[]]
-        for i, req in enumerate(tqdm(requests, desc="Batching...")):
-            if i < processed_count:
-                continue
+        remaining = requests[processed_count:]
+        for req in tqdm(remaining, desc=f"Batching... (resuming from {processed_count}/{len(requests)})"):
             batched_requests[-1].append(req)
             if len(batched_requests[-1]) == self.batch_size:
                 batched_requests.append([])
@@ -305,8 +316,13 @@ class LLaDAEvalHarness(LM):
             batched_requests.pop()
 
         start_time = time.time()
+        start_time -= elapsed_offset  # keep elapsed continuous across resumes
 
-        for batch in tqdm(batched_requests, desc="Generating..."):
+        pbar = tqdm(batched_requests, desc="Generating...",
+                    total=len(batched_requests),
+                    initial=0,
+                    postfix={"overall": f"{processed_count}/{len(requests)}"})
+        for batch in pbar:
             batched_input_ids = []
             max_len = 0
             pad_len = []
@@ -351,21 +367,23 @@ class LLaDAEvalHarness(LM):
 
             if self.is_instruct and 'task_id' in req.doc and str(req.doc['task_id']).lower().startswith('humaneval'):
                 generated_answer_ids = generated_answer[:, input_ids.shape[1]:]
-                if self.show_speed:
-                    num_tokens += (generated_answer_ids != 126081).sum()
-                    num_nfe += nfe
+                batched_item_tokens = [(generated_answer_ids[i] != 126081).sum().item() for i in range(len(generated_answer_ids))]
+                num_tokens += sum(batched_item_tokens)
+                num_nfe += nfe * len(batched_item_tokens)
                 batched_generated_answer = [self.tokenizer.decode(generated_answer_ids[i], skip_special_tokens=True) for i in range(len(generated_answer_ids))]
             else:
                 batched_generated_answer = []
+                batched_item_tokens = []
                 for i in range(len(generated_answer)):
                     generated_answer_i = self.tokenizer.decode(generated_answer[i][input_ids.shape[1]:], skip_special_tokens=False)
                     for stop_seq in stop_tokens:
                         if stop_seq in generated_answer_i:
                             generated_answer_i = generated_answer_i.split(stop_seq)[0]
                     generated_answer_ids = torch.tensor(self.tokenizer(generated_answer_i)["input_ids"])
-                    if self.show_speed:
-                        num_tokens += (generated_answer_ids != 126081).sum()
-                        num_nfe += nfe
+                    item_tokens = (generated_answer_ids != 126081).sum().item()
+                    num_tokens += item_tokens
+                    num_nfe += nfe
+                    batched_item_tokens.append(item_tokens)
                     generated_answer_i = self.tokenizer.decode(generated_answer_ids, skip_special_tokens=True)
                     batched_generated_answer.append(generated_answer_i)
 
@@ -373,10 +391,17 @@ class LLaDAEvalHarness(LM):
             output.extend(batched_generated_answer)
 
             if self.save_dir is not None:
-                # Incrementally save newly generated answers
+                # Incrementally save newly generated answers with stats
                 with open(save_path, 'a', encoding='utf-8') as f:
-                    for generated_answer in batched_generated_answer:
-                        f.write(json.dumps(generated_answer, ensure_ascii=False) + '\n')
+                    for gen_ans in batched_generated_answer:
+                        entry = {
+                            'answer': gen_ans,
+                            'tokens': int(num_tokens),
+                            'nfe': int(num_nfe),
+                            'elapsed': time.time() - start_time,
+                        }
+                        f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+                pbar.set_postfix({"overall": f"{len(output)}/{len(requests)}"})
 
             for i in range(len(batched_generated_answer)):
                 print('=' * 20)
@@ -387,11 +412,21 @@ class LLaDAEvalHarness(LM):
                 print('=' * 20, end='\n\n')
             # self.accelerator.wait_for_everyone()
         end_time = time.time()
+        total_time = end_time - start_time
         if self.show_speed:
             print(f"Total number of tokens generated: {num_tokens}")
-            print(f"Total time taken: {end_time - start_time} seconds")
-            print(f"Tokens per second: {num_tokens / (end_time - start_time)}")
+            print(f"Total time taken: {total_time} seconds")
+            print(f"Tokens per second: {num_tokens / total_time}")
             print(f"Total NFE is {num_nfe}")
+        if self.save_dir is not None:
+            with open(save_path, 'a', encoding='utf-8') as f:
+                summary = {
+                    'summary': True,
+                    'total_time': total_time,
+                    'total_tokens': int(num_tokens),
+                    'total_nfe': int(num_nfe),
+                }
+                f.write(json.dumps(summary, ensure_ascii=False) + '\n')
             
         return output
 
