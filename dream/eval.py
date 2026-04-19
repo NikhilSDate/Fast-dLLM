@@ -346,6 +346,9 @@ class Dream(LM):
             self.model._sample = types.MethodType(DreamGenerationMixin._sample, self.model)
 
         processed_count = 0
+        cumulative_tokens = 0
+        cumulative_nfe = 0
+        elapsed_offset = 0.0
         if self.save_dir is not None:
             os.makedirs(self.save_dir, exist_ok=True)
             rank = self.rank
@@ -354,8 +357,14 @@ class Dream(LM):
             if os.path.exists(save_path):
                 print(f"load from {save_path}")
                 with open(save_path, 'r', encoding='utf-8') as f:
-                    res = [json.loads(line) for line in f]
-                    processed_count = len(res)
+                    saved = [json.loads(line) for line in f]
+                # Support old plain-string format and new dict format
+                res = [s["answer"] if isinstance(s, dict) else s for s in saved]
+                processed_count = len(res)
+                if saved and isinstance(saved[-1], dict):
+                    cumulative_tokens = saved[-1].get("tokens", 0)
+                    cumulative_nfe = saved[-1].get("nfe", 0)
+                    elapsed_offset = saved[-1].get("elapsed", 0.0)
                 print(f"processed_count: {processed_count}")
 
         pbar = tqdm(
@@ -371,8 +380,12 @@ class Dream(LM):
             if batch_idx < processed_count:
                 pbar.update(len(contexts))
                 continue
-            
+
+            tokens_before = self.generated_token_num
             responses = self._generate_batch(contexts)
+            batch_elapsed = elapsed_offset + (time.time() - start_time)
+            tokens_this_batch = self.generated_token_num - tokens_before
+
             if not self.escape_until:
                 for i, r in enumerate(responses):
                     for s in gen_args[0]['until']:
@@ -386,10 +399,20 @@ class Dream(LM):
             pbar.update(len(contexts))
 
             if self.save_dir is not None:
-                # Incrementally save newly generated answers
+                # Incrementally save newly generated answers with metadata
+                nfe_per_sample = self.diffusion_steps
+                tokens_per_sample = tokens_this_batch // max(len(responses), 1)
                 for i, r in enumerate(responses):
+                    cumulative_tokens += tokens_per_sample
+                    cumulative_nfe += nfe_per_sample
+                    entry = {
+                        "answer": r,
+                        "tokens": cumulative_tokens,
+                        "nfe": cumulative_nfe,
+                        "elapsed": batch_elapsed,
+                    }
                     with open(save_path, 'a', encoding='utf-8') as f:
-                        f.write(json.dumps(r, ensure_ascii=False) + '\n')
+                        f.write(json.dumps(entry, ensure_ascii=False) + '\n')
 
         end_time = time.time()
         print(f"Time taken: {end_time - start_time} seconds")

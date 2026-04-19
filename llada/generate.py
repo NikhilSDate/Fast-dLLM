@@ -207,6 +207,105 @@ def generate_with_prefix_cache(model, prompt, steps=128, gen_length=128, block_l
 
     return x, nfe
 
+
+@torch.no_grad()
+def generate_prefix_cache_variable(model, prompt, steps=128, max_gen_length=256, block_length=128,
+                                   temperature=0., remasking='low_confidence', mask_id=126336,
+                                   eos_id=None, threshold=None, factor=None):
+    '''
+    Variable-length generation using prefix KV-cache. Generates block-by-block up to
+    max_gen_length, stopping early at the first block that contains eos_id.
+
+    Args:
+        model: Mask predictor.
+        prompt: A tensor of shape (B, L).
+        steps: Total sampling steps (divided evenly across blocks).
+        max_gen_length: Maximum tokens to generate; must be divisible by block_length.
+        block_length: Semi-autoregressive block size.
+        temperature: Categorical distribution sampling temperature.
+        remasking: Remasking strategy. 'low_confidence' or 'random'.
+        mask_id: The token id of [MASK] (default 126336).
+        eos_id: Token id used as end-of-sequence. If None, runs to max_gen_length.
+        threshold: Confidence threshold for unmasking (alternative to step-based quota).
+        factor: Dynamic transfer factor.
+
+    Returns:
+        x: (B, Lp + generated_length) — truncated at first EOS if found, else max_gen_length.
+        nfe: Number of function evaluations used.
+    '''
+    x = torch.full((prompt.shape[0], prompt.shape[1] + max_gen_length), mask_id, dtype=torch.long).to(model.device)
+    x[:, :prompt.shape[1]] = prompt.clone()
+
+    assert max_gen_length % block_length == 0
+    num_blocks = max_gen_length // block_length
+
+    assert steps % num_blocks == 0
+    steps_per_block = steps // num_blocks
+
+    nfe = 0
+
+    for num_block in range(num_blocks):
+        current_block_start = prompt.shape[1] + num_block * block_length
+        current_block_end = current_block_start + block_length
+
+        block_mask_index = (x[:, current_block_start:current_block_end] == mask_id)
+        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps_per_block)
+
+        # Step 0: full forward pass to warm KV cache for the prefix
+        output = model(x, use_cache=True)
+        past_key_values = output.past_key_values
+        nfe += 1
+
+        mask_index = (x == mask_id)
+        mask_index[:, current_block_end:] = 0
+        if factor is None:
+            x0, transfer_index = get_transfer_index(output.logits, temperature, remasking, mask_index, x, num_transfer_tokens[:, 0] if threshold is None else None, threshold)
+        else:
+            x0, transfer_index = get_transfer_index_dynamic(output.logits, temperature, remasking, mask_index, x, None, factor)
+        x[transfer_index] = x0[transfer_index]
+
+        # Truncate KV cache to prompt prefix only (strip block and beyond)
+        new_past_key_values = []
+        for i in range(len(past_key_values)):
+            new_past_key_values.append(())
+            for j in range(len(past_key_values[i])):
+                new_past_key_values[i] += (past_key_values[i][j][:, :, :current_block_start],)
+        past_key_values = new_past_key_values
+
+        # Refinement steps: only process current block with cached prefix
+        i = 1
+        while True:
+            if (x[:, current_block_start:current_block_end] == mask_id).sum() == 0:
+                break
+            nfe += 1
+            mask_index = (x[:, current_block_start:] == mask_id)
+            mask_index[:, block_length:] = 0
+
+            logits = model(x[:, current_block_start:], past_key_values=past_key_values, use_cache=True).logits
+
+            if factor is None:
+                x0, transfer_index = get_transfer_index(logits, temperature, remasking, mask_index,
+                                                        x[:, current_block_start:], num_transfer_tokens[:, i] if threshold is None else None, threshold)
+            else:
+                x0, transfer_index = get_transfer_index_dynamic(logits, temperature, remasking, mask_index,
+                                                                 x[:, current_block_start:], None, factor)
+            x[:, current_block_start:][transfer_index] = x0[transfer_index]
+            i += 1
+
+        # Check for EOS in the completed block
+        if eos_id is not None:
+            eos_mask = (x[:, current_block_start:current_block_end] == eos_id)  # (B, block_length)
+            if eos_mask.any():
+                # Find the first EOS position per batch item; take the earliest across items that have one
+                has_eos = eos_mask.any(dim=1)                               # (B,)
+                first_eos_per_item = eos_mask.int().argmax(dim=1)           # (B,) — valid only where has_eos
+                first_eos_col = first_eos_per_item[has_eos].min().item()    # earliest EOS column in block
+                cutoff = current_block_start + first_eos_col
+                return x[:, :cutoff + 1], nfe                               # include the EOS token
+
+    return x, nfe
+
+
 @torch.no_grad()
 def generate_with_dual_cache(
     model, prompt, steps=128, gen_length=128, block_length=128, temperature=0.,
@@ -439,10 +538,86 @@ def main():
         nvtx.range_push("INFER")
 
         out = generate_with_dual_cache(model, input_ids, steps=128, gen_length=128, block_length=32, temperature=0., remasking='low_confidence')
-    
+
         torch.cuda.synchronize()
         nvtx.range_pop()
     print(tokenizer.batch_decode(out[0][:, input_ids.shape[1]:], skip_special_tokens=True)[0])
 
+
+def main_variable():
+    import time
+
+    device = 'cuda'
+    MAX_GEN_LENGTH = 2048  # generous ceiling; early stopping may cut this short
+    BLOCK_LENGTH   = 32
+    STEPS          = 128  # must satisfy: STEPS % (MAX_GEN_LENGTH // BLOCK_LENGTH) == 0
+
+    assert STEPS % (MAX_GEN_LENGTH // BLOCK_LENGTH) == 0, \
+        f"steps={STEPS} must be divisible by num_blocks={MAX_GEN_LENGTH // BLOCK_LENGTH}"
+
+    model = LLaDAModelLM.from_pretrained(
+        'GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True, torch_dtype=torch.bfloat16
+    ).to(device).eval()
+    tokenizer = AutoTokenizer.from_pretrained('GSAI-ML/LLaDA-8B-Instruct', trust_remote_code=True)
+
+    prompt = "What is 1 + 1?"
+    m = [{"role": "user", "content": prompt}]
+    prompt_text = tokenizer.apply_chat_template(m, add_generation_prompt=True, tokenize=False)
+    input_ids = torch.tensor(tokenizer(prompt_text)['input_ids']).unsqueeze(0).to(device)
+    prompt_len = input_ids.shape[1]
+
+    print(f"Prompt tokens : {prompt_len}")
+    print(f"Max gen length: {MAX_GEN_LENGTH}")
+    print(f"EOS token id  : {tokenizer.eos_token_id}")
+    print()
+
+    # --- variable-length run ---
+    with torch.inference_mode():
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        out_var, nfe_var = generate_prefix_cache_variable(
+            model, input_ids,
+            steps=STEPS,
+            max_gen_length=MAX_GEN_LENGTH,
+            block_length=BLOCK_LENGTH,
+            temperature=0.,
+            remasking='low_confidence',
+            eos_id=tokenizer.eos_token_id,
+        )
+        torch.cuda.synchronize()
+        t_var = time.perf_counter() - t0
+
+    gen_len_var = out_var.shape[1] - prompt_len
+    text_var = tokenizer.batch_decode(out_var[:, prompt_len:], skip_special_tokens=True)[0]
+
+    print(f"[variable] generated tokens : {gen_len_var} / {MAX_GEN_LENGTH}  (EOS {'hit' if gen_len_var < MAX_GEN_LENGTH else 'not hit'})")
+    print(f"[variable] NFE              : {nfe_var}")
+    print(f"[variable] wall time        : {t_var:.2f}s")
+    print(f"[variable] output           :\n{text_var}")
+    print()
+
+    # --- fixed-length baseline for comparison ---
+    with torch.inference_mode():
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        out_fix, nfe_fix = generate_with_prefix_cache(
+            model, input_ids,
+            steps=STEPS,
+            gen_length=MAX_GEN_LENGTH,
+            block_length=BLOCK_LENGTH,
+            temperature=0.,
+            remasking='low_confidence',
+        )
+        torch.cuda.synchronize()
+        t_fix = time.perf_counter() - t0
+
+    text_fix = tokenizer.batch_decode(out_fix[:, prompt_len:], skip_special_tokens=True)[0]
+
+    print(f"[fixed]    generated tokens : {MAX_GEN_LENGTH}")
+    print(f"[fixed]    NFE              : {nfe_fix}")
+    print(f"[fixed]    wall time        : {t_fix:.2f}s")
+    print(f"[fixed]    output           :\n{text_fix}")
+
+
 if __name__ == '__main__':
-    main()
+    main_variable()
