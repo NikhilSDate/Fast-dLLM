@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -49,10 +51,76 @@ def find_latest_json(path: Path) -> Optional[Path]:
     return candidates[-1] if candidates else None
 
 
-def load_accuracy(result_root: Path) -> Optional[float]:
+def _extract_gsm8k_answer(text: str) -> str:
+    cleaned = text.replace(",", "")
+    matches = re.findall(r"-?\d+\.?\d*", cleaned)
+    if not matches:
+        return ""
+
+    answer = matches[-1]
+    if answer.endswith("."):
+        answer = answer[:-1]
+
+    try:
+        return str(round(float(answer)))
+    except Exception:
+        return ""
+
+
+@lru_cache(maxsize=1)
+def _load_gsm8k_gold_answers() -> list[str]:
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:
+        raise RuntimeError(
+            "datasets is required to score GSM8K predictions when results_*.json files are absent"
+        ) from exc
+
+    dataset = load_dataset("gsm8k", "main", split="test")
+    gold_answers: list[str] = []
+    for row in dataset:
+        gold_answers.append(_extract_gsm8k_answer(str(row["answer"])))
+    return gold_answers
+
+
+def load_predictions(log_path: Path) -> list[str]:
+    predictions: list[str] = []
+    if not log_path.exists():
+        return predictions
+
+    with log_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict) and "answer" in entry:
+                predictions.append(str(entry["answer"]))
+
+    return predictions
+
+
+def load_accuracy(result_root: Path, log_root: Path) -> Optional[float]:
     result_path = find_latest_json(result_root)
     if result_path is None:
-        return None
+        predictions = load_predictions(log_root / "rank_0.jsonl")
+        if not predictions:
+            return None
+
+        gold_answers = _load_gsm8k_gold_answers()
+        limit = min(len(predictions), len(gold_answers))
+        if limit == 0:
+            return None
+
+        correct = 0
+        for prediction, gold_answer in zip(predictions[:limit], gold_answers[:limit]):
+            if _extract_gsm8k_answer(prediction) == gold_answer:
+                correct += 1
+
+        return 100.0 * correct / limit
 
     with result_path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
@@ -116,7 +184,7 @@ def load_run(label: str, kind: str, root: Path, gen_length: int, tag: str, thres
     result_root = root / "evals_results" / "Figure5" / "GSM8K" / f"len{gen_length}" / tag
     log_root = root / "results" / "Figure5" / "GSM8K" / f"len{gen_length}" / tag
 
-    accuracy = load_accuracy(result_root)
+    accuracy = load_accuracy(result_root, log_root)
     avg_nfe, avg_tokens, throughput, samples = load_log_stats(log_root)
 
     return RunStats(
@@ -195,13 +263,33 @@ def annotate_selected(ax, x, y, text_offset=(10, 10)):
     )
 
 
+def annotate_point_labels(ax, x_values, y_values, labels, y_offset_points=6, color="#8b0000"):
+    for x, y, label in zip(x_values, y_values, labels):
+        ax.annotate(
+            f"{float(label):.2f}",
+            xy=(x, y),
+            xytext=(0, y_offset_points),
+            textcoords="offset points",
+            fontsize=9,
+            ha="center",
+            va="bottom",
+            color=color,
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Plot Figure 5 GSM8K results.")
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="Repository root directory.")
     parser.add_argument("--gen-length", type=int, default=512, help="Generation length used for the runs.")
     parser.add_argument("--output", type=Path, default=Path("figures/figure5_gsm8k.png"), help="Output image path.")
     parser.add_argument("--csv", type=Path, default=Path("figures/figure5_gsm8k_summary.csv"), help="Output CSV summary path.")
-    args_local = parser.parse_args()
+    parser.add_argument(
+        "--separate-panels",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Also export each subplot as its own image/PDF for LaTeX composition.",
+    )
+    args = parser.parse_args()
 
     thresholds = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
     fixed_tokens = [1, 2, 4, 8]
@@ -234,6 +322,11 @@ def main() -> int:
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.6), constrained_layout=True)
     threshold_df = df[df["kind"] == "threshold"].sort_values("threshold")
     fixed_df = df[df["kind"] == "fixed"].sort_values("tokens_per_step_target")
+    baseline_styles = {
+        2: {"color": "#fb8c00", "label": "2 tokens per step"},
+        4: {"color": "#43a047", "label": "4 tokens per step"},
+        8: {"color": "#1e88e5", "label": "8 tokens per step"},
+    }
 
     # Panel (a): accuracy vs threshold
     ax = axes[0]
@@ -247,21 +340,27 @@ def main() -> int:
         linewidth=2.5,
         label="Ours",
     )
-    for _, row in threshold_df.iterrows():
-        ax.text(row["threshold"], row["accuracy"] + 0.25, f"{row['avg_tokens_per_step']:.1f}", fontsize=9, ha="center", color="#8b0000")
+    annotate_point_labels(
+        ax,
+        threshold_df["threshold"],
+        threshold_df["accuracy"],
+        threshold_df["avg_tokens_per_step"],
+    )
     for baseline_tokens in [2, 4, 8]:
+        style = baseline_styles[baseline_tokens]
         baseline_row = fixed_df[fixed_df["tokens_per_step_target"] == baseline_tokens].iloc[0]
         ax.axhline(
             baseline_row["accuracy"],
-            color="#455a64",
+            color=style["color"],
             linestyle="--",
             linewidth=1.3,
             alpha=0.9,
-            label="Fixed-step baseline" if baseline_tokens == 2 else None,
+            label=style["label"],
         )
     selected_row = threshold_df[threshold_df["threshold"] == 0.9].iloc[0]
     annotate_selected(ax, selected_row["threshold"], selected_row["accuracy"], text_offset=(8, 12))
     ax.set_xlim(0.48, 1.02)
+    ax.legend(loc="center right", frameon=False, fontsize=10)
 
     # Panel (b): inference steps vs threshold
     ax = axes[1]
@@ -275,18 +374,26 @@ def main() -> int:
         linewidth=2.5,
         label="Ours",
     )
+    annotate_point_labels(
+        ax,
+        threshold_df["threshold"],
+        threshold_df["avg_nfe"],
+        threshold_df["avg_tokens_per_step"],
+    )
     for baseline_tokens in [2, 4, 8]:
+        style = baseline_styles[baseline_tokens]
         baseline_row = fixed_df[fixed_df["tokens_per_step_target"] == baseline_tokens].iloc[0]
         ax.axhline(
             baseline_row["avg_nfe"],
-            color="#455a64",
+            color=style["color"],
             linestyle="--",
             linewidth=1.3,
             alpha=0.9,
-            label="Fixed-step baseline" if baseline_tokens == 2 else None,
+            label=style["label"],
         )
     annotate_selected(ax, selected_row["threshold"], selected_row["avg_nfe"], text_offset=(8, 12))
     ax.set_xlim(0.48, 1.02)
+    ax.legend(loc="upper left", frameon=False, fontsize=10)
 
     # Panel (c): accuracy vs average tokens per step
     ax = axes[2]
@@ -300,8 +407,14 @@ def main() -> int:
         linewidth=2.5,
         label="Ours",
     )
+    annotate_point_labels(
+        ax,
+        threshold_df["avg_tokens_per_step"],
+        threshold_df["accuracy"],
+        threshold_df["avg_tokens_per_step"],
+    )
     ax.scatter(
-        fixed_df["avg_tokens_per_step"],
+        fixed_df["tokens_per_step_target"],
         fixed_df["accuracy"],
         color="#1565c0",
         marker="^",
@@ -309,10 +422,18 @@ def main() -> int:
         label="Fixed-step baselines",
         zorder=5,
     )
+    ax.plot(
+        fixed_df["tokens_per_step_target"],
+        fixed_df["accuracy"],
+        color="#1565c0",
+        linestyle="--",
+        linewidth=2,
+        alpha=0.7,
+    )
 
     baseline_row = fixed_df[fixed_df["tokens_per_step_target"] == 1].iloc[0]
-    ax.axvline(
-        baseline_row["avg_tokens_per_step"],
+    ax.axhline(
+        baseline_row["accuracy"],
         color="#616161",
         linestyle="--",
         linewidth=1.2,
@@ -322,17 +443,16 @@ def main() -> int:
     for _, row in fixed_df.iterrows():
         ax.annotate(
             f"{int(row['tokens_per_step_target'])}",
-            xy=(row["avg_tokens_per_step"], row["accuracy"]),
+            xy=(row["tokens_per_step_target"], row["accuracy"]),
             xytext=(5, 5),
             textcoords="offset points",
             fontsize=9,
             color="#0d47a1",
         )
     annotate_selected(ax, selected_row["avg_tokens_per_step"], selected_row["accuracy"], text_offset=(8, 12))
-
-    handles, labels = axes[2].get_legend_handles_labels()
-    unique = dict(zip(labels, handles))
-    fig.legend(unique.values(), unique.keys(), loc="upper center", ncol=4, frameon=False, bbox_to_anchor=(0.5, 1.02))
+    ax.set_xlim(0, 9)
+    ax.set_xticks([0, 2, 4, 6, 8])
+    ax.legend(loc="lower left", frameon=False, fontsize=10)
 
     for ax in axes:
         ax.tick_params(axis="both", labelsize=10)
@@ -343,6 +463,22 @@ def main() -> int:
     print(f"Wrote {args.output}")
     print(f"Wrote {args.output.with_suffix('.pdf')}")
     print(f"Wrote {args.csv}")
+
+    if args.separate_panels:
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        stem = args.output.stem
+        suffix = args.output.suffix
+
+        for panel_name, axis in zip(("a", "b", "c"), axes):
+            panel_path = args.output.with_name(f"{stem}_panel_{panel_name}{suffix}")
+            panel_pdf = panel_path.with_suffix(".pdf")
+            bbox = axis.get_tightbbox(renderer).expanded(1.03, 1.08)
+            bbox_inches = bbox.transformed(fig.dpi_scale_trans.inverted())
+            fig.savefig(panel_path, dpi=220, bbox_inches=bbox_inches)
+            fig.savefig(panel_pdf, dpi=220, bbox_inches=bbox_inches)
+            print(f"Wrote {panel_path}")
+            print(f"Wrote {panel_pdf}")
 
     if missing:
         print("Missing metrics for:")

@@ -5,7 +5,7 @@
 #
 #   Setting | LLaDA (baseline) | No Cache (parallel) | PrefixCache | DualCache
 #   --------|------------------|---------------------|-------------|----------
-#   5-shot  |  llada/baseline  |  llada/parallel     | llada/prefix-cache-parallel | dream/dual-cache-parallel
+#   5-shot  |  llada/baseline  |  llada/parallel     | llada/prefix-cache-parallel | llada/dual-cache-parallel
 #   8-shot  |       "          |       "             |      "      |       "
 #
 # Usage (inside a tmux session):
@@ -34,8 +34,8 @@ SRUN_NTASKS=1
 SRUN_GPUS=1
 SRUN_MEM="32g"
 
-LLADA_GEN_LENGTH="${LLADA_GEN_LENGTH:-${GEN_LENGTH:-512}}"
-DREAM_GEN_LENGTH="${DREAM_GEN_LENGTH:-${GEN_LENGTH:-256}}"
+LLADA_GEN_LENGTH="${LLADA_GEN_LENGTH:-${GEN_LENGTH:-1024}}"
+DREAM_GEN_LENGTH="${DREAM_GEN_LENGTH:-${GEN_LENGTH:-1024}}"
 
 LOG_DIR="${ROOT_DIR}/evals_results/GSM8K-table-logs"
 mkdir -p "${LOG_DIR}"
@@ -60,16 +60,18 @@ run_until_done() {
     llada)
         gen_length="${LLADA_GEN_LENGTH}"
         eval_script="scripts/reproduce_llada_gsm8k.sh"
-        save_dir="${ROOT_DIR}/results/GSM8K-table/llada/len${gen_length}/${mode}/${num_fewshot}shot"
-        output_path="${ROOT_DIR}/evals_results/GSM8K-table/llada/len${gen_length}/${mode}/${num_fewshot}shot"
-        result_file="${save_dir}/rank_0.jsonl"
+        # Note: the underlying script appends /${mode} to save_dir internally,
+        # so we must NOT include mode here.
+        save_dir="${ROOT_DIR}/results/GSM8K-table/llada/len${gen_length}/${num_fewshot}shot"
+        output_path="${ROOT_DIR}/evals_results/GSM8K-table/llada/len${gen_length}/${num_fewshot}shot"
+        result_file="${save_dir}/${mode}/rank_0.jsonl"
         ;;
     dream)
         gen_length="${DREAM_GEN_LENGTH}"
         eval_script="scripts/reproduce_dream_gsm8k.sh"
-        save_dir="${ROOT_DIR}/results/GSM8K-table/dream/len${gen_length}/${mode}/${num_fewshot}shot"
-        output_path="${ROOT_DIR}/evals_results/GSM8K-table/dream/len${gen_length}/${mode}/${num_fewshot}shot"
-        result_file="${save_dir}/rank_0.jsonl"
+        save_dir="${ROOT_DIR}/results/GSM8K-table/dream/len${gen_length}/${num_fewshot}shot"
+        output_path="${ROOT_DIR}/evals_results/GSM8K-table/dream/len${gen_length}/${num_fewshot}shot"
+        result_file="${save_dir}/${mode}/rank_0.jsonl"
         ;;
     *)
         echo "[ERROR] Unknown model: ${model}"
@@ -138,7 +140,7 @@ run_until_done() {
 #   LLaDA (baseline)        → llada  baseline              5 / 8
 #   No Cache (parallel)     → llada  parallel              5 / 8
 #   PrefixCache             → llada  prefix-cache-parallel  5 / 8
-#   DualCache               → dream  dual-cache-parallel   5 / 8
+#   DualCache               → llada  dual-cache-parallel   5 / 8
 
 RUNS=(
     "llada  baseline              5"
@@ -147,8 +149,8 @@ RUNS=(
     "llada  parallel              8"
     "llada  prefix-cache-parallel 5"
     "llada  prefix-cache-parallel 8"
-    "dream  dual-cache-parallel   5"
-    "dream  dual-cache-parallel   8"
+    "llada  dual-cache-parallel   5"
+    "llada  dual-cache-parallel   8"
 )
 
 echo "================================================================"
@@ -177,8 +179,9 @@ BASE_EVALS  = os.path.join(ROOT, "evals_results", "GSM8K-table")
 BASE_RESULTS = os.path.join(ROOT, "results",      "GSM8K-table")
 
 def get_acc(model, mode, fewshot, gen_length):
-    pattern = os.path.join(BASE_EVALS, model, f"len{gen_length}", mode,
-                           f"{fewshot}shot", "*", "results_*.json")
+    # Directory structure: BASE_EVALS/{model}/len{N}/{fewshot}shot/{mode}/*/results_*.json
+    pattern = os.path.join(BASE_EVALS, model, f"len{gen_length}",
+                           f"{fewshot}shot", mode, "*", "results_*.json")
     files = sorted(glob.glob(pattern))
     if not files:
         return None
@@ -190,8 +193,9 @@ def get_acc(model, mode, fewshot, gen_length):
 
 def get_speed(model, mode, fewshot, gen_length):
     """Compute tokens/s = sum(tokens) / sum(elapsed) across rank_0.jsonl."""
-    path = os.path.join(BASE_RESULTS, model, f"len{gen_length}", mode,
-                        f"{fewshot}shot", "rank_0.jsonl")
+    # Directory structure: BASE_RESULTS/{model}/len{N}/{fewshot}shot/{mode}/rank_0.jsonl
+    path = os.path.join(BASE_RESULTS, model, f"len{gen_length}",
+                        f"{fewshot}shot", mode, "rank_0.jsonl")
     if not os.path.exists(path):
         return None
     total_tokens = 0.0
@@ -218,7 +222,7 @@ cols = [
     ("LLaDA",       "llada", "baseline",              llada_len),
     ("No Cache",    "llada", "parallel",              llada_len),
     ("PrefixCache", "llada", "prefix-cache-parallel", llada_len),
-    ("DualCache",   "dream", "dual-cache-parallel",   dream_len),
+    ("DualCache",   "llada", "dual-cache-parallel",   llada_len),
 ]
 
 COL_W = 16

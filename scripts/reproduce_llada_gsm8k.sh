@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Reproduce LLaDA GSM8K experiments for 4 settings:
-#   baseline, prefix-cache, parallel, prefix-cache-parallel
+# Reproduce LLaDA GSM8K experiments for 5 settings:
+#   baseline, prefix-cache, parallel, prefix-cache-parallel, dual-cache-parallel
 #
 # Usage:
-#   bash scripts/reproduce_llada_gsm8k.sh [all|baseline|prefix-cache|parallel|prefix-cache-parallel]
+#   bash scripts/reproduce_llada_gsm8k.sh [all|baseline|prefix-cache|parallel|prefix-cache-parallel|dual-cache-parallel]
 #
 # Optional environment overrides:
 #   MODEL_PATH, GEN_LENGTH, BLOCK_LENGTH, NUM_FEWSHOT, OUTPUT_PATH, SAVE_DIR
@@ -27,8 +27,8 @@ block_length="${BLOCK_LENGTH:-32}"
 num_fewshot="${NUM_FEWSHOT:-5}"
 steps_parallel="$((length / block_length))"
 model_path="${MODEL_PATH:-GSAI-ML/LLaDA-8B-Instruct}"
-output_path="${OUTPUT_PATH:-evals_results/len${length}}"
-save_dir="${SAVE_DIR:-./results/len${length}}"
+output_path="${OUTPUT_PATH:-evals_results/GSM8K-LLaDA/len${length}}"
+save_dir="${SAVE_DIR:-./results/GSM8K-LLaDA/len${length}}"
 mode="${1:-all}"
 
 run_eval() {
@@ -65,6 +65,10 @@ run_prefix_cache_parallel() {
     run_eval "prefix-cache-parallel" "steps=${steps_parallel},block_length=${block_length},use_cache=True,threshold=0.9"
 }
 
+run_dual_cache_parallel() {
+    run_eval "dual-cache-parallel" "steps=${length},block_length=${block_length},use_cache=True,dual_cache=True,threshold=0.9"
+}
+
 run_prefix_cache_variable() {
     run_eval "prefix-cache-variable" "steps=${length},block_length=${block_length},variable_cache=True"
 }
@@ -75,6 +79,7 @@ all)
     run_prefix_cache
     run_parallel
     run_prefix_cache_parallel
+    run_dual_cache_parallel
     ;;
 baseline)
     run_baseline
@@ -88,12 +93,15 @@ parallel)
 prefix-cache-parallel)
     run_prefix_cache_parallel
     ;;
+dual-cache-parallel)
+    run_dual_cache_parallel
+    ;;
 prefix-cache-variable)
     run_prefix_cache_variable
     ;;
 *)
     echo "Unknown mode: ${mode}"
-    echo "Expected one of: all, baseline, prefix-cache, parallel, prefix-cache-parallel, prefix-cache-variable"
+    echo "Expected one of: all, baseline, prefix-cache, parallel, prefix-cache-parallel, dual-cache-parallel, prefix-cache-variable"
     exit 1
     ;;
 esac

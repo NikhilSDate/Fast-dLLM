@@ -18,7 +18,7 @@
 import torch
 import argparse
 
-from generate import generate, generate_with_prefix_cache, generate_with_dual_cache
+from generate import generate, generate_with_prefix_cache, generate_with_dual_cache, generate_streaming_blocks
 from transformers import AutoTokenizer, AutoModel
 from model.modeling_llada import LLaDAModelLM
 
@@ -46,8 +46,20 @@ def chat(args):
             prompt = input_ids
         else:
             prompt = torch.cat([prompt, input_ids[:, 1:]], dim=1)
-        print(f'use cache: {args.use_cache} use cache position: {args.if_cache_position} threshold: {args.threshold} block size: {args.block_size}')
-        if args.use_cache:
+        print(f'use cache: {args.use_cache} use cache position: {args.if_cache_position} threshold: {args.threshold} block size: {args.block_size} streaming: {args.streaming}')
+        if args.streaming:
+            out, nfe = generate_streaming_blocks(
+                model, prompt,
+                steps=steps,
+                block_length=args.block_size,
+                max_gen_length=gen_length,
+                temperature=0.,
+                remasking='low_confidence',
+                eos_id=tokenizer.eos_token_id,
+                threshold=args.threshold,
+                use_cache=args.use_cache,
+            )
+        elif args.use_cache:
             if args.if_cache_position:
                 out, nfe = generate_with_dual_cache(model, prompt, steps=steps, gen_length=gen_length, block_length=args.block_size, temperature=0., remasking='low_confidence', threshold=args.threshold)
             else:
@@ -67,12 +79,16 @@ def chat(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gen_length", type=int, default=128)
+    parser.add_argument("--gen_length", type=int, default=4096)
     parser.add_argument("--steps", type=int, default=128)
     parser.add_argument("--block_size", type=int, default=32)
     parser.add_argument("--use_cache", action="store_true")
     parser.add_argument("--if_cache_position", action="store_true")
     parser.add_argument("--threshold", type=float, default=None)
+    parser.add_argument("--streaming", action="store_true",
+                        help="Decode one block at a time with no suffix masks. "
+                             "--steps is interpreted as steps-per-block. "
+                             "--use_cache enables prefix KV-cache for each block.")
 
     args = parser.parse_args()
     chat(args)

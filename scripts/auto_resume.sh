@@ -20,7 +20,7 @@ set -uo pipefail
 
 MODEL="${1:-llada}"
 MODE="${2:-baseline}"
-GEN_LENGTH="${GEN_LENGTH:-512}"
+GEN_LENGTH="${GEN_LENGTH:-}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV="/u/xzhou12/fastdllm_venv/bin/activate"
 
@@ -30,14 +30,16 @@ TOTAL=1319
 # Resolve per-model result path and eval script
 case "${MODEL}" in
 llada)
-    RESULT_FILE="${ROOT_DIR}/results/len${GEN_LENGTH}/${MODE}/rank_0.jsonl"
     EVAL_SCRIPT="scripts/reproduce_llada_gsm8k.sh"
     DEFAULT_GEN_LENGTH=512
+    SAVE_DIR_ROOT="${ROOT_DIR}/results"
+    OUTPUT_PATH_ROOT="${ROOT_DIR}/evals_results"
     ;;
 dream)
-    RESULT_FILE="${ROOT_DIR}/results/GSM8K-Dream/len${GEN_LENGTH}/${MODE}/rank_0.jsonl"
     EVAL_SCRIPT="scripts/reproduce_dream_gsm8k.sh"
     DEFAULT_GEN_LENGTH=256
+    SAVE_DIR_ROOT="${ROOT_DIR}/results/GSM8K-Dream"
+    OUTPUT_PATH_ROOT="${ROOT_DIR}/evals_results/GSM8K-Dream"
     ;;
 *)
     echo "Unknown MODEL: ${MODEL}. Expected: llada | dream"
@@ -46,6 +48,9 @@ dream)
 esac
 
 GEN_LENGTH="${GEN_LENGTH:-${DEFAULT_GEN_LENGTH}}"
+SAVE_DIR="${SAVE_DIR_ROOT}/len${GEN_LENGTH}"
+OUTPUT_PATH="${OUTPUT_PATH_ROOT}/len${GEN_LENGTH}"
+RESULT_FILE="${SAVE_DIR}/${MODE}/rank_0.jsonl"
 
 LOG_DIR="${ROOT_DIR}/evals_results"
 LOG_FILE="${LOG_DIR}/gsm8k_${MODEL}_${MODE}_len${GEN_LENGTH}_autoresume_$(date +%F_%H-%M).log"
@@ -99,7 +104,7 @@ while true; do
         --partition="${SRUN_PARTITION}" \
         --gpus="${SRUN_GPUS}" \
         --mem="${SRUN_MEM}" \
-        bash -c "source ${VENV} && cd ${ROOT_DIR} && GEN_LENGTH=${GEN_LENGTH} bash ${EVAL_SCRIPT} ${MODE}" \
+        bash -c "source ${VENV} && cd ${ROOT_DIR} && GEN_LENGTH=${GEN_LENGTH} SAVE_DIR=${SAVE_DIR} OUTPUT_PATH=${OUTPUT_PATH} bash ${EVAL_SCRIPT} ${MODE}" \
     && SRUN_EXIT=0 || SRUN_EXIT=$?
 
     DONE=$(get_done)

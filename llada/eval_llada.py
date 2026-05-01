@@ -33,7 +33,7 @@ from lm_eval.api.registry import register_model
 from tqdm import tqdm
 import os
 from transformers import AutoTokenizer, AutoModel, AutoConfig
-from generate import generate, generate_with_prefix_cache, generate_with_dual_cache, generate_prefix_cache_variable
+from generate import generate, generate_with_prefix_cache, generate_with_dual_cache, generate_prefix_cache_variable, generate_streaming_blocks
 from model.modeling_llada import LLaDAModelLM
 import json
 import time
@@ -68,6 +68,7 @@ class LLaDAEvalHarness(LM):
         show_speed=False,
         dual_cache=False,
         variable_cache=False,
+        streaming=False,
         **kwargs,
     ):
         '''
@@ -136,6 +137,7 @@ class LLaDAEvalHarness(LM):
         self.show_speed = show_speed
         self.dual_cache = dual_cache
         self.variable_cache = variable_cache
+        self.streaming = streaming
     @property
     def rank(self):
         return self._rank
@@ -356,7 +358,16 @@ class LLaDAEvalHarness(LM):
 
             stop_tokens = req.args[1]['until']
             input_ids = batched_input_ids
-            if self.variable_cache:
+            if self.streaming:
+                # steps is interpreted as steps-per-block for streaming generation
+                generated_answer, nfe = generate_streaming_blocks(self.model, input_ids,
+                                        steps=self.steps, block_length=self.block_length,
+                                        max_gen_length=self.gen_length,
+                                        temperature=0, remasking=self.remasking,
+                                        mask_id=self.mask_id, threshold=self.threshold,
+                                        eos_id=self.tokenizer.eos_token_id,
+                                        use_cache=self.use_cache)
+            elif self.variable_cache:
                 generated_answer, nfe = generate_prefix_cache_variable(self.model, input_ids, steps=self.steps, max_gen_length=self.gen_length, block_length=self.block_length,
                                         temperature=0, remasking=self.remasking, mask_id=self.mask_id, threshold=self.threshold, factor=self.factor,
                                         eos_id=self.tokenizer.eos_token_id)

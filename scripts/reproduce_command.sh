@@ -16,9 +16,12 @@ GEN_LENGTH=256 bash scripts/auto_resume.sh dream prefix-cache-parallel
 # Example: run LLaDA parallel with gen_length=512
 GEN_LENGTH=512 bash scripts/auto_resume.sh llada parallel
 GEN_LENGTH=256 bash scripts/auto_resume.sh llada prefix-cache-variable
+GEN_LENGTH=256 bash scripts/auto_resume.sh llada dual-cache-parallel
+GEN_LENGTH=512 bash scripts/auto_resume.sh llada dual-cache-parallel
 
 ssh <delta-login-node>
 tmux attach -t fastdllm
+tmux attach -t gsm8k_table
 tmux a
 tmux ls
 tail -f /projects/bdes/ndate/Fast-dLLM/evals_results/<your-log-file>.log

@@ -394,6 +394,122 @@ def generate_with_dual_cache(
 
 
 
+@torch.no_grad()
+def generate_streaming_blocks(
+    model, prompt, steps=128, block_length=32, max_gen_length=2048,
+    temperature=0., remasking='low_confidence', mask_id=126336,
+    eos_id=None, threshold=None, use_cache=False,
+):
+    '''
+    Streaming block generation: allocate and decode one block of mask tokens at a
+    time. After each block is fully decoded, check for EOS; if not found, append
+    the next block of mask tokens. No suffix masks beyond the current block are
+    ever present in the sequence, so the model never attends to future positions.
+
+    Args:
+        model: Mask predictor.
+        prompt: (B, Lp) long tensor.
+        steps: Diffusion steps *per block* (not total).
+        block_length: Number of tokens per streaming block.
+        max_gen_length: Hard cap on generated tokens; must be a multiple of block_length.
+        temperature: Gumbel noise temperature.
+        remasking: 'low_confidence' or 'random'.
+        mask_id: Token id for [MASK] (default 126336).
+        eos_id: If given, stop at the first block that contains this token.
+        threshold: Confidence threshold (alternative to step-based quota).
+        use_cache: When True, cache the KV for the prefix before the current block.
+
+    Returns:
+        x: (B, Lp + generated) — truncated at first EOS block if eos_id is set.
+        nfe: Total number of model forward passes.
+    '''
+    assert max_gen_length % block_length == 0, \
+        f"max_gen_length={max_gen_length} must be divisible by block_length={block_length}"
+
+    B, Lp = prompt.shape
+    device = model.device
+
+    # Pre-allocate the full output buffer once.  The generation region is already
+    # all mask_id, so future blocks are implicitly present; we just slide the
+    # active window x[:, :e] forward each iteration without any reallocation.
+    x = torch.full((B, Lp + max_gen_length), mask_id, dtype=torch.long, device=device)
+    x[:, :Lp] = prompt.clone().to(device)
+
+    nfe = 0
+
+    for block_idx in range(max_gen_length // block_length):
+        s = Lp + block_idx * block_length   # block start (absolute)
+        e = s + block_length                 # block end   (absolute)
+
+        # x[:, :e] is the active window: prompt + decoded blocks + current mask
+        # block.  Nothing beyond position e is ever passed to the model.
+        block_mask_index    = (x[:, s:e] == mask_id)
+        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
+
+        if use_cache:
+            # ── Prefix-cache path ────────────────────────────────────────────
+            output = model(x[:, :e], use_cache=True)
+            past_key_values = output.past_key_values
+            nfe += 1
+
+            # Step 0: unmask from full-pass logits, active window only
+            mask_index = (x[:, :e] == mask_id)
+            x0, transfer_index = get_transfer_index(
+                output.logits, temperature, remasking, mask_index, x[:, :e],
+                num_transfer_tokens[:, 0] if threshold is None else None, threshold,
+            )
+            x[:, :e][transfer_index] = x0[transfer_index]
+
+            # Truncate KV cache to the decoded prefix (positions 0..s-1)
+            past_key_values = [
+                tuple(kv[:, :, :s] for kv in layer_kv)
+                for layer_kv in past_key_values
+            ]
+
+            # Refinement: current block only, on top of the cached prefix
+            step_i = 1
+            while True:
+                if (x[:, s:e] == mask_id).sum() == 0:
+                    break
+                nfe += 1
+                mask_index_blk = (x[:, s:e] == mask_id)
+                logits = model(
+                    x[:, s:e],
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                ).logits
+                x0, transfer_index = get_transfer_index(
+                    logits, temperature, remasking, mask_index_blk, x[:, s:e],
+                    num_transfer_tokens[:, step_i] if threshold is None else None, threshold,
+                )
+                x[:, s:e][transfer_index] = x0[transfer_index]
+                step_i += 1
+        else:
+            # ── No-cache path ────────────────────────────────────────────────
+            for step_i in range(steps):
+                if (x[:, s:e] == mask_id).sum() == 0:
+                    break
+                nfe += 1
+                mask_index = (x[:, :e] == mask_id)
+                logits = model(x[:, :e]).logits
+                x0, transfer_index = get_transfer_index(
+                    logits, temperature, remasking, mask_index, x[:, :e],
+                    num_transfer_tokens[:, step_i] if threshold is None else None, threshold,
+                )
+                x[:, :e][transfer_index] = x0[transfer_index]
+
+        # Check for EOS in the completed block
+        if eos_id is not None:
+            eos_in_block = (x[:, s:e] == eos_id)
+            if eos_in_block.any():
+                has_eos       = eos_in_block.any(dim=1)
+                first_eos_col = eos_in_block.int().argmax(dim=1)
+                earliest_col  = first_eos_col[has_eos].min().item()
+                return x[:, :s + earliest_col + 1], nfe
+
+    return x, nfe
+
+
 def get_transfer_index(
     logits: torch.Tensor,
     temperature: float,

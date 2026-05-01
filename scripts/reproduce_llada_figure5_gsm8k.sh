@@ -45,12 +45,14 @@ run_eval() {
 
     local current_save_dir="${save_root}/${tag}"
     local current_output_path="${output_root}/${tag}"
+    local current_log_path="${current_save_dir}/eval.log"
 
     mkdir -p "${current_save_dir}" "${current_output_path}"
 
     echo "[figure5/gsm8k] Running ${tag}"
     echo "  save_dir    = ${current_save_dir}"
     echo "  output_path = ${current_output_path}"
+    echo "  log_path    = ${current_log_path}"
 
     accelerate launch llada/eval_llada.py \
         --tasks "${task}" \
@@ -59,7 +61,7 @@ run_eval() {
         --model llada_dist \
         --model_args "model_path=${model_path},gen_length=${length},${extra_model_args},show_speed=True,save_dir=${current_save_dir}" \
         --output_path "${current_output_path}" \
-        --log_samples
+        --log_samples 2>&1 | tee "${current_log_path}"
 }
 
 run_threshold_sweep() {
