@@ -32,14 +32,24 @@ Dataset substitution for GSM8K:
 
 from __future__ import annotations
 
+import argparse
 import subprocess
-import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
+
+_print_lock = threading.Lock()
+
+
+def _log(prefix: str, msg: str) -> None:
+    ts = time.strftime("%H:%M:%S")
+    with _print_lock:
+        print(f"[{ts}] [{prefix}] {msg}", flush=True)
 
 def get_task_total(task: str) -> int:
     """Get the expected number of samples for a task.
@@ -54,7 +64,7 @@ def get_task_total(task: str) -> int:
         "humaneval": 164,
         "aime24": 30,
         "aime24_3shot": 30,
-        "longbench_summarization": 600,  # 3 English subtasks × 200 samples each
+        "longbench_gov_report": 200,
     }
     return base_totals.get(task)
 
@@ -326,6 +336,7 @@ def count_done(save_dir: Path) -> int:
 
 
 def run_experiment(run: ExperimentRun) -> None:
+    prefix = f"{run.experiment_name}/{run.tag}"
     save_dir = resolve_save_dir(run)
     output_path = resolve_output_path(run)
 
@@ -336,17 +347,10 @@ def run_experiment(run: ExperimentRun) -> None:
     save_dir.mkdir(parents=True, exist_ok=True)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    model_type = type(run.model).__name__
     model_id = run.model.pretrained if isinstance(run.model, DreamConfig) else run.model.model_path
-
-    print()
-    print("=" * 70)
-    print(f"  {run.experiment_name}/{run.tag}")
-    print(f"  task      : {run.task}  (total={total})")
-    print(f"  model     : {model_type}  {model_id}")
-    print(f"  save_dir  : {save_dir}")
-    print(f"  output    : {output_path}")
-    print("=" * 70)
+    _log(prefix, f"task={run.task}  total={total}  model={model_id}")
+    _log(prefix, f"save_dir={save_dir}")
+    _log(prefix, f"output={output_path}")
 
     sr = run.srun
     srun_prefix = [
@@ -365,11 +369,10 @@ def run_experiment(run: ExperimentRun) -> None:
     while True:
         attempt += 1
         done = count_done(save_dir)
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{ts}]  Attempt #{attempt}  |  {done}/{total}", flush=True)
+        _log(prefix, f"attempt #{attempt}  |  {done}/{total}")
 
         if done >= total:
-            print(f"[{ts}]  Complete ({done}/{total}).", flush=True)
+            _log(prefix, f"complete ({done}/{total})")
             break
 
         payload = build_payload(run, save_dir, output_path)
@@ -377,23 +380,47 @@ def run_experiment(run: ExperimentRun) -> None:
         srun_exit = result.returncode
 
         done = count_done(save_dir)
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{ts}]  srun exited (code={srun_exit})  |  {done}/{total}", flush=True)
+        _log(prefix, f"srun exited (code={srun_exit})  |  {done}/{total}")
 
         if done >= total:
-            print(f"[{ts}]  Complete!", flush=True)
+            _log(prefix, "complete!")
             break
 
-        print(f"[{ts}]  Waiting 15s before re-queuing...", flush=True)
+        _log(prefix, "waiting 15s before re-queuing...")
         time.sleep(15)
 
 
-def run_all(experiments: list[ExperimentRun]) -> None:
+def run_all(experiments: list[ExperimentRun], workers: int = 1) -> None:
     n = len(experiments)
-    print(f"\nRunning {n} experiment(s) sequentially.\n")
-    for i, exp in enumerate(experiments, 1):
-        print(f"\n[{i}/{n}]  {exp.experiment_name}/{exp.tag}", flush=True)
-        run_experiment(exp)
+    print(f"\nRunning {n} experiment(s) with {workers} parallel worker(s).\n")
+    for exp in experiments:
+        print(f"  • {exp.experiment_name}/{exp.tag}")
+    print()
+
+    running: set[str] = set()
+    lock = threading.Lock()
+
+    def _run(run: ExperimentRun) -> None:
+        label = f"{run.experiment_name}/{run.tag}"
+        with lock:
+            running.add(label)
+            print(f"\n>>> STARTED  {label}  |  running: {', '.join(sorted(running))}", flush=True)
+        try:
+            run_experiment(run)
+        finally:
+            with lock:
+                running.discard(label)
+                print(f"\n>>> FINISHED {label}  |  running: {', '.join(sorted(running)) or '(none)'}", flush=True)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_run, exp): exp for exp in experiments}
+        for future in as_completed(futures):
+            exp = futures[future]
+            exc = future.exception()
+            if exc:
+                label = f"{exp.experiment_name}/{exp.tag}"
+                print(f"\n>>> FAILED   {label}: {exc}", flush=True)
+
     print("\nAll experiments complete.")
 
 
@@ -699,22 +726,46 @@ EXPERIMENTS: list[ExperimentRun] = [
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-j", "--jobs", type=int, default=1,
+                        help="number of experiments to run in parallel (default: 1)")
+    args = parser.parse_args()
+
+    _SRUN = SrunConfig(time="01:00:00")
+    _BASE = dict(
+        experiment_name="GovReport-LLaDA",
+        task="longbench_gov_report",
+        batch_size=1,
+        srun=_SRUN,
+    )
+
     experiments = [
-        # ── LLaDA LongBench Summarization — dual-cache + parallel decoding ────
+        # ── baseline: no cache, no parallel decoding ──────────────────────────
+        ExperimentRun(
+            tag="baseline",
+            model=LLaDaConfig(gen_length=512, steps=512, block_length=32),
+            **_BASE,
+        ),
+        # ── dual-cache only ───────────────────────────────────────────────────
+        ExperimentRun(
+            tag="dual-cache",
+            model=LLaDaConfig(gen_length=512, steps=512, block_length=32,
+                              use_cache=True, dual_cache=True),
+            **_BASE,
+        ),
+        # ── parallel decoding only (threshold=0.9) ────────────────────────────
+        ExperimentRun(
+            tag="parallel",
+            model=LLaDaConfig(gen_length=512, steps=512, block_length=32,
+                              threshold=0.9),
+            **_BASE,
+        ),
+        # ── dual-cache + parallel decoding (threshold=0.9) ───────────────────
         ExperimentRun(
             tag="dual-cache-parallel",
-            experiment_name="LongBench-Summarization-LLaDA",
-            task="longbench_summarization",
-            batch_size=1,
-            srun=SrunConfig(time="00:30:00"),
-            model=LLaDaConfig(
-                gen_length=512,
-                steps=16,          # gen_length // block_length
-                block_length=32,
-                use_cache=True,
-                dual_cache=True,
-                threshold=0.9,
-            ),
+            model=LLaDaConfig(gen_length=512, steps=512, block_length=32,
+                              use_cache=True, dual_cache=True, threshold=0.9),
+            **_BASE,
         ),
     ]
-    run_all(experiments)
+    run_all(experiments, workers=args.jobs)

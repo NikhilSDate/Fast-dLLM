@@ -339,6 +339,10 @@ class LLaDAEvalHarness(LM):
                 else:
                     user_input = question
                     input_ids = self.tokenizer(user_input)['input_ids']
+                max_prompt_len = self.max_length - self.gen_length
+                if len(input_ids) > max_prompt_len:
+                    half = max_prompt_len // 2
+                    input_ids = input_ids[:half] + input_ids[len(input_ids) - (max_prompt_len - half):]
                 batched_input_ids.append(input_ids)
                 max_len = max(max_len, len(input_ids))
                 pad_len.append(max_len - len(input_ids))
@@ -424,6 +428,10 @@ class LLaDAEvalHarness(LM):
                             'prefill_len': prefill_len,
                             'total_len': prefill_len + self.gen_length,
                         }
+                        doc = batch[i].doc
+                        target = doc.get('answers', doc.get('answer', ''))
+                        if target:
+                            entry['target'] = target
                         f.write(json.dumps(entry, ensure_ascii=False) + '\n')
                 pbar.set_postfix({"overall": f"{len(output)}/{len(requests)}"})
 
