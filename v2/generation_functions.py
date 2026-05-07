@@ -29,12 +29,16 @@ class Fast_dLLM_QwenForCausalLM:
         use_block_cache=False,
         top_p=0.95,
         temperature=0.0,
+        factor=False,
+        factor_value=1.0,
     ):
         num_blocks = max_new_tokens // block_size + seq_len.max().item() // block_size
         batch_size = input_ids.shape[0]
+        nfe = 0
 
         if min_len > block_size:
             output = self.forward(input_ids=input_ids[:, :(min_len // block_size * block_size)], use_cache=True, update_past_key_values=True, block_size=block_size)
+            nfe += 1
             logits, past_key_values = output.logits, output.past_key_values
             if min_len % block_size == 0:
                 predict_sample_idx = (seq_len == min_len)
@@ -79,6 +83,7 @@ class Fast_dLLM_QwenForCausalLM:
                     if finished_flag.all():
                         break
                     output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=True, block_size=block_size)
+                    nfe += 1
                     logits, past_key_values = output.logits, output.past_key_values
                     next_token = logits[:, -1:, :].argmax(dim=-1)
                     next_token[finished_flag] = tokenizer.pad_token_id
@@ -101,24 +106,30 @@ class Fast_dLLM_QwenForCausalLM:
                         if use_block_cache:
                             if block_past_key_values is None or (x_t[:, -block_size+small_block_start_idx] == mask_id).any():
                                 output = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True)
+                                nfe += 1
                                 logits, block_past_key_values = output.logits, output.block_past_key_values
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                                 logits = logits[:, start:end]
                             else:
                                 logits = self.forward(input_ids=x_t[:,start:end], use_cache=True, past_key_values=past_key_values, update_past_key_values=False, use_block_cache=True, block_past_key_values=block_past_key_values, replace_position=small_block_start_idx).logits
+                                nfe += 1
                                 logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                         else:
                             logits = self.forward(input_ids=x_t[:, -block_size:], use_cache=True, past_key_values=past_key_values, update_past_key_values=False).logits
+                            nfe += 1
                             logits = torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
                             logits = logits[:, start:end]
                         x_1, p_1t = self.sample_with_top_p(logits, top_p=top_p, temperature=temperature)
                         x1_p = torch.squeeze(torch.gather(p_1t, dim=-1, index=torch.unsqueeze(x_1, -1)), -1)
                         x1_p = torch.where(mask_idx[:, start:end], x1_p, -torch.inf)
 
-                        unmask_idx = (x1_p > threshold)
-                        max_prob_idx = x1_p.argmax(dim=-1)
-                        unmask_idx[torch.arange(x_1.shape[0]), max_prob_idx] = True
-                        unmask_idx = unmask_idx & mask_idx[:, start:end]
+                        if factor:
+                            unmask_idx = get_factor_unmask_idx(x1_p, mask_idx[:, small_block_start_idx:small_block_end_idx], factor_value)
+                        else:
+                            unmask_idx = (x1_p > threshold)
+                            max_prob_idx = x1_p.argmax(dim=-1)
+                            unmask_idx[torch.arange(x_1.shape[0]), max_prob_idx] = True
+                            unmask_idx = unmask_idx & mask_idx[:, start:end]
 
                         x_t[:, start:end][unmask_idx] = x_1[unmask_idx]
 
@@ -165,7 +176,7 @@ class Fast_dLLM_QwenForCausalLM:
                 finished_samples[original_idx] = x_t[sample_idx:sample_idx+1].clone().squeeze(dim=0)
         
         assert len(finished_samples) == batch_size
-        return finished_samples
+        return finished_samples, nfe
 
     @torch.no_grad()
     def mdm_sample_with_visualization(
@@ -321,6 +332,41 @@ class Fast_dLLM_QwenForCausalLM:
         # Return final text
         final_text = tokenizer.decode(generated_tokens, skip_special_tokens=True)
         yield final_text
+
+
+def get_factor_unmask_idx(x1_p, mask_idx_small, factor_value=1.0):
+    """
+    Factor-based parallel decoding (mirrors get_transfer_index_dynamic from v1).
+
+    Selects the largest n such that (n+1)(1 - c(n)) < factor_value, where c(n)
+    is the n-th highest confidence among masked positions in the small block.
+    At least one token is always unmasked.
+
+    Args:
+        x1_p: (B, L) float — confidence scores; -inf at non-masked positions.
+        mask_idx_small: (B, L) bool — which positions are currently masked.
+        factor_value: decoding factor hyperparameter (default 1.0).
+
+    Returns:
+        unmask_idx: (B, L) bool — positions to unmask this step.
+    """
+    unmask_idx = torch.zeros_like(x1_p, dtype=torch.bool)
+    for j in range(x1_p.shape[0]):
+        num_masked = mask_idx_small[j].sum().item()
+        if num_masked == 0:
+            continue
+        conf_j = x1_p[j]
+        sorted_conf = conf_j[mask_idx_small[j]].sort(descending=True)[0]
+        threshs = [1.0 - factor_value / (n + 1) for n in range(1, num_masked + 1)]
+        threshs[0] = -1.0  # always unmask at least one token
+        for top_i in range(num_masked):
+            if sorted_conf[top_i].item() < threshs[top_i]:
+                break
+        if top_i == 0 or top_i == num_masked - 1:
+            top_i += 1
+        _, select_index = torch.topk(conf_j, k=top_i)
+        unmask_idx[j, select_index] = True
+    return unmask_idx & mask_idx_small
 
 
 def setup_model_with_custom_generation(model):

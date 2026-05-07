@@ -1,0 +1,37 @@
+% Table comparing Factor vs Threshold parallel decoding strategies (batch size 1)
+% Rows: dataset; Columns: strategy
+% Each cell: Accuracy / Throughput (tok/s) / Tokens per NFE
+%
+% Data sources:
+%   Accuracy : evals_results/v2/{dataset}-FastDLLMv2/{strategy}/cache-block32-batch1/
+%   Speed    : results/v2/{dataset}-FastDLLMv2/{strategy}/cache-block32-batch1/rank_0.jsonl (last line)
+%
+% Model: Efficient-Large-Model/Fast_dLLM_v2_1.5B
+% Factor value: 1.0   |   Threshold: 0.9
+% GSM8K accuracy: flexible-extract exact match
+% HumanEval accuracy: pass@1 via llada/postprocess_code.py (lm-eval pass@1 is unreliable for this setup)
+
+\begin{table}[t]
+\centering
+\caption{%
+  Comparison of factor-based and threshold-based parallel decoding strategies
+  at batch size~1 using the Fast-dLLM v2 1.5B model.
+}
+\label{tab:factor-vs-threshold-batch1}
+\setlength{\tabcolsep}{8pt}
+\begin{tabular}{l cc}
+\toprule
+& \textbf{Factor ($\alpha=1.0$)} & \textbf{Threshold ($\tau=0.9$)} \\
+\midrule
+\multirow{3}{*}{\textbf{GSM8K}}
+  & Acc.: 52.6\%    & Acc.: 61.9\% \\
+  & 117.3 tok/s     & 88.4 tok/s \\
+  & 3.40 tok/NFE    & 2.57 tok/NFE \\
+\addlinespace
+\multirow{3}{*}{\textbf{HumanEval}}
+  & Acc.: 29.9\%    & Acc.: 37.2\% \\
+  & 105.5 tok/s     & 81.4 tok/s \\
+  & 3.12 tok/NFE    & 2.40 tok/NFE \\
+\bottomrule
+\end{tabular}
+\end{table}

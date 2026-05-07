@@ -52,6 +52,9 @@ def get_task_total(task: str) -> int:
     base_totals = {
         "gsm8k": 90 if use_aimo else 1319,
         "humaneval": 164,
+        "aime24": 30,
+        "aime24_3shot": 30,
+        "longbench_summarization": 600,  # 3 English subtasks × 200 samples each
     }
     return base_totals.get(task)
 
@@ -89,7 +92,7 @@ def resolve_dream_eval_script() -> Path:
 @dataclass
 class SrunConfig:
     account: str = "bdes-delta-gpu"
-    time: str = "01:00:00"
+    time: str = "00:30:00"
     partition: str = "gpuA100x4"
     nodes: int = 1
     ntasks: int = 1
@@ -165,8 +168,9 @@ class ExperimentRun:
     task: str
     model: Union[LLaDaConfig, DreamConfig]
     num_fewshot: Optional[int] = None
+    batch_size: int = 1
     srun: SrunConfig = field(default_factory=SrunConfig)
-    venv: str = "/u/jvancosampedro/fastdllm_venv/bin/activate"
+    venv: str = "/u/ndate/venv/bin/activate"
     save_dir: Optional[Path] = None
     output_path: Optional[Path] = None
 
@@ -250,13 +254,16 @@ def build_payload(run: ExperimentRun, save_dir: Path, output_path: Path) -> str:
         llada_eval_script = resolve_llada_eval_script()
         model_args = _llada_model_args(model, save_dir)
         fewshot_flag = f"--num_fewshot {run.num_fewshot} " if run.num_fewshot is not None else ""
+        include_path_flag = f"--include_path {ROOT_DIR / 'lm_eval_tasks'} " if (ROOT_DIR / "lm_eval_tasks").exists() else ""
         eval_cmd = (
             f"accelerate launch {llada_eval_script} "
             f"--tasks {run.task} "
             f"{fewshot_flag}"
+            f"{include_path_flag}"
             f"--confirm_run_unsafe_code "
             f"--model llada_dist "
             f"--model_args '{model_args}' "
+            f"--batch_size {run.batch_size} "
             f"--output_path {output_path} "
             f"--log_samples"
         )
@@ -612,6 +619,25 @@ EXPERIMENTS: list[ExperimentRun] = [
     #     model=DreamConfig(max_new_tokens=256, diffusion_steps=8, alg="confidence_threshold", threshold=0.9, use_cache=True, dual_cache=True),
     # ),
 
+    # ── LLaDA AIME 2024 — 1-shot, gen_length=1024, dual-cache + parallel ───
+    ExperimentRun(
+        tag="baseline",
+        experiment_name="AIME24-LLaDA",
+        task="aime24",
+        num_fewshot=1,
+        batch_size=8,
+        model=LLaDaConfig(gen_length=1024, steps=1024, block_length=32),
+    ),
+    ExperimentRun(
+        tag="dual-cache-parallel",
+        experiment_name="AIME24-LLaDA",
+        task="aime24",
+        num_fewshot=1,
+        batch_size=8,
+        model=LLaDaConfig(gen_length=1024, steps=32, block_length=32,
+                          use_cache=True, dual_cache=True, threshold=0.9),
+    ),
+
     # ── LLaDA HumanEval ─────────────────────────────────────────────────────
     ExperimentRun(
         tag="baseline",
@@ -674,26 +700,21 @@ EXPERIMENTS: list[ExperimentRun] = [
 
 if __name__ == "__main__":
     experiments = [
-        # ── Streaming prefix-cache ────────────────────────────────────────────
+        # ── LLaDA LongBench Summarization — dual-cache + parallel decoding ────
         ExperimentRun(
-            tag="streaming-prefix-cache",
-            experiment_name="GSM8K-LLaDA",
-            task="gsm8k",
-            num_fewshot=5,
-            model=LLaDaConfig(gen_length=256, steps=32, block_length=32, use_cache=True, streaming=True),
+            tag="dual-cache-parallel",
+            experiment_name="LongBench-Summarization-LLaDA",
+            task="longbench_summarization",
+            batch_size=1,
+            srun=SrunConfig(time="00:30:00"),
+            model=LLaDaConfig(
+                gen_length=512,
+                steps=16,          # gen_length // block_length
+                block_length=32,
+                use_cache=True,
+                dual_cache=True,
+                threshold=0.9,
+            ),
         ),
-
-        # ── Dual-cache block-size sweep ───────────────────────────────────────
-        *[
-            ExperimentRun(
-                tag=f"dual-cache/block{bl}",
-                experiment_name="GSM8K-LLaDA",
-                task="gsm8k",
-                num_fewshot=5,
-                model=LLaDaConfig(gen_length=256, block_length=bl, use_cache=True, dual_cache=True),
-            )
-            for bl in [8]
-        ],
     ]
-
     run_all(experiments)

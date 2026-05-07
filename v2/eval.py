@@ -60,17 +60,22 @@ class Fast_dLLM_v2EvalHarness(LM):
         small_block_size=8,
         bd_size=32,
         threshold=0.9,
+        factor=False,
+        factor_value=1.0,
+        save_dir=None,
         **kwargs,
     ):
 
         super().__init__()
 
-        accelerator = accelerate.Accelerator()
-        if accelerator.num_processes > 1:
-            self.accelerator = accelerator
-        else:
-            self.accelerator = None
+        # accelerator = accelerate.Accelerator()
+        # if accelerator.num_processes > 1:
+        #     self.accelerator = accelerator
+        # else:
+        #     self.accelerator = None
         
+        self.accelerator = None
+
         model_kwargs = {}
         if self.accelerator is not None:
             model_kwargs.update({'device_map': {'': f'{self.accelerator.device}'}})
@@ -107,6 +112,9 @@ class Fast_dLLM_v2EvalHarness(LM):
         self.small_block_size = small_block_size
         self.threshold = threshold
         self.bd_size = bd_size
+        self.factor = factor
+        self.factor_value = factor_value
+        self.save_dir = save_dir
 
     @property
     def rank(self):
@@ -205,14 +213,33 @@ class Fast_dLLM_v2EvalHarness(LM):
         return out
     
     def generate_until(self, requests):
-        output = [None] * len(requests)  # pre-allocate output list
+        output = [None] * len(requests)
         num_tokens = 0
-        
-        start_time = time.time()
-        
+        num_nfe = 0
+        elapsed_offset = 0.0
+        processed_count = 0
+
+        save_path = None
+        saved_answers = []
+        if self.save_dir is not None:
+            os.makedirs(self.save_dir, exist_ok=True)
+            save_path = os.path.join(self.save_dir, 'rank_0.jsonl')
+            if os.path.exists(save_path):
+                print(f"Resuming from {save_path}")
+                with open(save_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        entry = json.loads(line)
+                        if isinstance(entry, dict) and 'answer' in entry:
+                            saved_answers.append(entry['answer'])
+                            num_tokens = entry.get('tokens', num_tokens)
+                            num_nfe = entry.get('nfe', num_nfe)
+                            elapsed_offset = entry.get('elapsed', elapsed_offset)
+                            processed_count += 1
+                print(f"Loaded {processed_count} existing results")
+
         requests_with_indices = [(i, req) for i, req in enumerate(requests)]
         requests_with_indices.sort(key=lambda x: len(x[1].args[0]))
-        
+
         batched_requests = []
         current_batch = []
         for i, req in requests_with_indices:
@@ -220,19 +247,29 @@ class Fast_dLLM_v2EvalHarness(LM):
             if len(current_batch) == self.batch_size:
                 batched_requests.append(current_batch)
                 current_batch = []
-        
         if current_batch:
             batched_requests.append(current_batch)
 
-        for _, batch in enumerate(tqdm(batched_requests, desc="Generating...")):
+        start_time = time.time() - elapsed_offset
+        item_cursor = 0
+
+        for batch in tqdm(batched_requests, desc="Generating..."):
+            batch_end = item_cursor + len(batch)
+            if batch_end <= processed_count:
+                for batch_pos, (orig_idx, req) in enumerate(batch):
+                    saved_idx = item_cursor + batch_pos
+                    if saved_idx < len(saved_answers):
+                        output[orig_idx] = saved_answers[saved_idx]
+                item_cursor = batch_end
+                continue
+
             batched_input_ids = []
             max_len = 0
             min_len = 1e9
             seq_len = []
-            
+
             for orig_idx, req in batch:
                 question = req.args[0]
-                
                 if req.task_name.startswith('minerva_math'):
                     question = question.replace("Solution:", "Please reason step by step, and put your final answer within \\boxed{{}}.")
                 elif req.task_name.startswith('gsm8k'):
@@ -242,65 +279,79 @@ class Fast_dLLM_v2EvalHarness(LM):
                 max_len = max(max_len, model_inputs["input_ids"].shape[1])
                 min_len = min(min_len, model_inputs["input_ids"].shape[1])
                 seq_len.append(model_inputs["input_ids"].shape[1])
-            
-            # pad batched_input_ids to the same length
+
             batched_input_ids = [torch.cat([input_ids, torch.full((1, max_len - input_ids.shape[1]), self.mask_id, dtype=torch.long, device=self.device)], dim=1) for input_ids in batched_input_ids]
-            batched_input_ids = torch.cat(batched_input_ids, dim=0)
-            batched_input_ids = batched_input_ids.to(self.device)
-            
+            batched_input_ids = torch.cat(batched_input_ids, dim=0).to(self.device)
+
             with torch.no_grad():
                 if self.accelerator is not None:
-                    generated_ids = self.accelerator.unwrap_model(self.model).mdm_sample(
-                        batched_input_ids,
-                        tokenizer=self.tokenizer,
-                        block_size=self.bd_size,
-                        small_block_size=self.small_block_size,
-                        max_new_tokens=self.max_new_tokens,
-                        mask_id=self.mask_id,
-                        min_len=min_len,
-                        seq_len=torch.tensor(seq_len, device=self.device),
-                        use_block_cache=self.use_block_cache,
-                        threshold=self.threshold,
+                    generated_ids, nfe = self.accelerator.unwrap_model(self.model).mdm_sample(
+                        batched_input_ids, tokenizer=self.tokenizer,
+                        block_size=self.bd_size, small_block_size=self.small_block_size,
+                        max_new_tokens=self.max_new_tokens, mask_id=self.mask_id,
+                        min_len=min_len, seq_len=torch.tensor(seq_len, device=self.device),
+                        use_block_cache=self.use_block_cache, threshold=self.threshold,
+                        factor=self.factor, factor_value=self.factor_value,
                     )
                 else:
-                    generated_ids = self.model.mdm_sample(
-                        batched_input_ids,
-                        tokenizer=self.tokenizer,
-                        block_size=self.bd_size,
-                        small_block_size=self.small_block_size,
-                        max_new_tokens=self.max_new_tokens,
-                        mask_id=self.mask_id,
-                        min_len=min_len,
-                        seq_len=torch.tensor(seq_len, device=self.device),
-                        use_block_cache=self.use_block_cache,
-                        threshold=self.threshold,
+                    generated_ids, nfe = self.model.mdm_sample(
+                        batched_input_ids, tokenizer=self.tokenizer,
+                        block_size=self.bd_size, small_block_size=self.small_block_size,
+                        max_new_tokens=self.max_new_tokens, mask_id=self.mask_id,
+                        min_len=min_len, seq_len=torch.tensor(seq_len, device=self.device),
+                        use_block_cache=self.use_block_cache, threshold=self.threshold,
+                        factor=self.factor, factor_value=self.factor_value,
                     )
-            
-            # extract new generated tokens, and keep original index order
+
+            num_nfe += nfe
             for batch_pos, (orig_idx, req) in enumerate(batch):
-                generated_answer = self.tokenizer.decode(
-                    generated_ids[batch_pos][seq_len[batch_pos]:], 
-                    skip_special_tokens=True
-                )
-            
-                # count token number
-                if self.show_speed:
-                    num_tokens += (generated_ids[batch_pos][seq_len[batch_pos]:] != self.mask_id).sum()
-                
-                # put result in the correct original index position
+                gen_tokens = generated_ids[batch_pos][seq_len[batch_pos]:]
+                generated_answer = self.tokenizer.decode(gen_tokens, skip_special_tokens=True)
+                item_tokens = int((gen_tokens != self.mask_id).sum().item())
+                num_tokens += item_tokens
                 output[orig_idx] = generated_answer
 
+                total_items = item_cursor + batch_pos + 1
                 print('=' * 20)
                 print('question: ', req.args[0])
                 print('answer: ', generated_answer)
+                print('nfe: ', nfe)
+                print('avg tokens/nfe: ', num_tokens / num_nfe if num_nfe else 0)
                 print('=' * 20, end='\n\n')
-            
+
+                if save_path is not None:
+                    with open(save_path, 'a', encoding='utf-8') as f:
+                        entry = {
+                            'answer': generated_answer,
+                            'tokens': int(num_tokens),
+                            'nfe': int(num_nfe),
+                            'elapsed': time.time() - start_time,
+                        }
+                        f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+
+            item_cursor = batch_end
+
         end_time = time.time()
+        total_time = end_time - start_time
+        total_items = sum(1 for x in output if x is not None)
         if self.show_speed:
-            print(f"Total number of tokens generated: {num_tokens}")
-            print(f"Total time taken: {end_time - start_time} seconds")
-            print(f"Tokens per second: {num_tokens / (end_time - start_time)}")
-            
+            print(f"Total tokens generated: {num_tokens}")
+            print(f"Total time: {total_time:.1f}s")
+            print(f"Tokens/second: {num_tokens / total_time:.1f}")
+            print(f"Total NFE: {num_nfe}")
+            print(f"Avg tokens/NFE: {num_tokens / num_nfe if num_nfe else 0:.2f}")
+
+        if save_path is not None:
+            with open(save_path, 'a', encoding='utf-8') as f:
+                summary = {
+                    'summary': True,
+                    'total_time': total_time,
+                    'total_tokens': int(num_tokens),
+                    'total_nfe': int(num_nfe),
+                    'avg_tokens_per_nfe': num_tokens / num_nfe if num_nfe else 0,
+                }
+                f.write(json.dumps(summary, ensure_ascii=False) + '\n')
+
         return output
 
 

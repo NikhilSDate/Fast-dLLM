@@ -343,6 +343,9 @@ class LLaDAEvalHarness(LM):
                 max_len = max(max_len, len(input_ids))
                 pad_len.append(max_len - len(input_ids))
             
+            # save original (unpadded) prefill lengths before overwriting the list
+            prefill_lengths = [len(ids) for ids in batched_input_ids]
+            print(prefill_lengths)
             # pad batched_input_ids to the same length
             batched_input_ids = [torch.cat([torch.full((1, max_len - len(input_ids)), self.tokenizer.pad_token_id, dtype=torch.long, device=self.device), torch.tensor(input_ids, dtype=torch.long, device=self.device).unsqueeze(0)], dim=1) for input_ids in batched_input_ids]
             batched_input_ids = torch.cat(batched_input_ids, dim=0)
@@ -410,12 +413,16 @@ class LLaDAEvalHarness(LM):
             if self.save_dir is not None:
                 # Incrementally save newly generated answers with stats
                 with open(save_path, 'a', encoding='utf-8') as f:
-                    for gen_ans in batched_generated_answer:
+                    for i, gen_ans in enumerate(batched_generated_answer):
+                        prefill_len = prefill_lengths[i]
                         entry = {
                             'answer': gen_ans,
                             'tokens': int(num_tokens),
                             'nfe': int(num_nfe),
                             'elapsed': time.time() - start_time,
+                            'item_tokens': int(batched_item_tokens[i]),
+                            'prefill_len': prefill_len,
+                            'total_len': prefill_len + self.gen_length,
                         }
                         f.write(json.dumps(entry, ensure_ascii=False) + '\n')
                 pbar.set_postfix({"overall": f"{len(output)}/{len(requests)}"})
